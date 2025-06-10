@@ -81,8 +81,7 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="Сканировать QR")],
-            [types.KeyboardButton(text="Ввести ID вручную")],
-            [types.KeyboardButton(text="Меню пользователя")]
+            [types.KeyboardButton(text="Ввести ID вручную")]
         ],
         resize_keyboard=True
     )
@@ -97,23 +96,21 @@ async def start_command(message: types.Message):
     user = cursor.fetchone()
     
     if user:
-        await message.answer(
-            "Добро пожаловать обратно!",
-            reply_markup=get_user_keyboard()
-        )
+        if user_id in ADMIN_IDS:
+            await message.answer(
+                "Добро пожаловать, администратор!",
+                reply_markup=get_admin_keyboard()
+            )
+        else:
+            await message.answer(
+                "Добро пожаловать обратно!",
+                reply_markup=get_user_keyboard()
+            )
     else:
         await message.answer(
             "Добро пожаловать в нашу кофейню! Для регистрации введите /register",
             reply_markup=ReplyKeyboardRemove()
         )
-
-@dp.message(Command('menu'))
-async def menu_command(message: types.Message):
-    user_id = message.from_user.id
-    if user_id in ADMIN_IDS:
-        await message.answer("Админ-меню:", reply_markup=get_admin_keyboard())
-    else:
-        await message.answer("Главное меню:", reply_markup=get_user_keyboard())
 
 # ========== КЛИЕНТСКИЕ ФУНКЦИИ ==========
 
@@ -123,7 +120,8 @@ async def register_command(message: types.Message, state: FSMContext):
     
     cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
     if cursor.fetchone():
-        await message.answer("Вы уже зарегистрированы!", reply_markup=get_user_keyboard())
+        keyboard = get_admin_keyboard() if user_id in ADMIN_IDS else get_user_keyboard()
+        await message.answer("Вы уже зарегистрированы!", reply_markup=keyboard)
         return
     
     await message.answer("Пожалуйста, введите ваш номер телефона для регистрации:", reply_markup=ReplyKeyboardRemove())
@@ -141,13 +139,17 @@ async def process_phone(message: types.Message, state: FSMContext):
     conn.commit()
     
     await state.clear()
+    keyboard = get_admin_keyboard() if user.id in ADMIN_IDS else get_user_keyboard()
     await message.answer(
         "Регистрация завершена!",
-        reply_markup=get_user_keyboard()
+        reply_markup=keyboard
     )
 
 @dp.message(F.text == "Мой QR-код")
 async def handle_qr_request(message: types.Message):
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("Пожалуйста, используйте админское меню", reply_markup=get_admin_keyboard())
+        return
     await show_qr_code(message)
 
 async def show_qr_code(message: types.Message):
@@ -179,9 +181,10 @@ async def show_bonuses(message: types.Message):
     result = cursor.fetchone()
     
     if result:
+        reply_markup = get_admin_keyboard() if user_id in ADMIN_IDS else get_user_keyboard()
         await message.answer(
             f"Ваш текущий баланс бонусов: {result[0]}",
-            reply_markup=get_user_keyboard()
+            reply_markup=reply_markup
         )
     else:
         await message.answer(
@@ -191,6 +194,10 @@ async def show_bonuses(message: types.Message):
 
 @dp.message(F.text == "История операций")
 async def show_history(message: types.Message):
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("Пожалуйста, используйте админское меню", reply_markup=get_admin_keyboard())
+        return
+    
     user_id = message.from_user.id
     
     cursor.execute('''
@@ -216,28 +223,14 @@ async def show_history(message: types.Message):
     
     await message.answer(response, reply_markup=get_user_keyboard())
 
-# ========== АДМИН-ПАНЕЛЬ ==========
+# ========== АДМИН-ФУНКЦИИ ==========
 
-@dp.message(Command('admin'))
-async def admin_panel(message: types.Message):
+@dp.message(F.text == "Сканировать QR")
+async def request_qr_scan(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("Доступ запрещен", reply_markup=get_user_keyboard())
         return
     
-    await message.answer(
-        "Админ-панель. Выберите действие:",
-        reply_markup=get_admin_keyboard()
-    )
-
-@dp.message(F.text == "Меню пользователя")
-async def user_menu_button(message: types.Message):
-    await message.answer(
-        "Переключено в пользовательский режим",
-        reply_markup=get_user_keyboard()
-    )
-
-@dp.message(F.text == "Сканировать QR")
-async def request_qr_scan(message: types.Message, state: FSMContext):
     await message.answer(
         "Пожалуйста, отправьте фото QR-кода:",
         reply_markup=ReplyKeyboardRemove()
@@ -246,6 +239,10 @@ async def request_qr_scan(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "Ввести ID вручную")
 async def request_manual_id(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Доступ запрещен", reply_markup=get_user_keyboard())
+        return
+    
     await message.answer(
         "Введите ID пользователя:",
         reply_markup=ReplyKeyboardRemove()
@@ -289,7 +286,8 @@ async def process_manual_input(message: types.Message, state: FSMContext):
 
 async def process_user_id(user_id: int, message: types.Message, state: FSMContext):
     cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    if not cursor.fetchone():
+    user = cursor.fetchone()
+    if not user:
         await message.answer(
             f"Пользователь с ID {user_id} не найден.",
             reply_markup=get_admin_keyboard()
@@ -306,7 +304,9 @@ async def process_user_id(user_id: int, message: types.Message, state: FSMContex
     builder.adjust(2)
     
     await message.answer(
-        f"Пользователь ID: {user_id}. Выберите действие:",
+        f"Пользователь: {user[2]} (ID: {user_id})\n"
+        f"Текущий баланс: {user[4]} бонусов\n"
+        "Выберите действие:",
         reply_markup=builder.as_markup(resize_keyboard=True)
     )
     await state.set_state(AdminStates.waiting_for_points_action)
@@ -337,6 +337,7 @@ async def process_points_amount(message: types.Message, state: FSMContext):
         if action == "Начислить бонусы":
             new_points = current_points + points
             description = "Начисление администратором"
+            operation_type = "начислено"
         else:
             if current_points < points:
                 await message.answer(
@@ -346,7 +347,9 @@ async def process_points_amount(message: types.Message, state: FSMContext):
                 return
             new_points = current_points - points
             description = "Списание администратором"
+            operation_type = "списано"
         
+        # Обновляем баланс и записываем транзакцию
         cursor.execute('UPDATE users SET bonus_points = ? WHERE user_id = ?', (new_points, user_id))
         cursor.execute(
             'INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)',
@@ -354,11 +357,27 @@ async def process_points_amount(message: types.Message, state: FSMContext):
         )
         conn.commit()
         
+        # Уведомление администратора
         await message.answer(
-            f"Успешно! Новый баланс: {new_points} бонусов\n"
-            f"Операция: {action} {points} бонусов",
+            f"✅ Успешно!\n"
+            f"Пользователю ID: {user_id}\n"
+            f"{operation_type.capitalize()}: {points} бонусов\n"
+            f"Новый баланс: {new_points} бонусов",
             reply_markup=get_admin_keyboard()
         )
+        
+        # Уведомление пользователя
+        try:
+            await bot.send_message(
+                user_id,
+                f"📢 Уведомление о бонусах\n"
+                f"Вам {operation_type} {points} бонусов\n"
+                f"Текущий баланс: {new_points} бонусов\n"
+                f"Операция: {description}"
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+        
         await state.clear()
         
     except ValueError:
@@ -370,10 +389,16 @@ async def process_points_amount(message: types.Message, state: FSMContext):
 @dp.message(F.text == "Отмена")
 async def cancel_action(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "Действие отменено.",
-        reply_markup=get_admin_keyboard() if message.from_user.id in ADMIN_IDS else get_user_keyboard()
-    )
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_admin_keyboard()
+        )
+    else:
+        await message.answer(
+            "Действие отменено.",
+            reply_markup=get_user_keyboard()
+        )
 
 async def main():
     await dp.start_polling(bot)
