@@ -1,19 +1,18 @@
 import os
 import sqlite3
 import qrcode
+import io
+import asyncio
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.enums import ParseMode
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, ReplyKeyboardMarkup
 from aiogram.types import ReplyKeyboardRemove, BufferedInputFile
-from aiogram.types import Message, ContentType
 from aiogram.filters import Command
-import io
-import asyncio
-from dotenv import load_dotenv 
+from dotenv import load_dotenv
 from PIL import Image
 from pyzbar.pyzbar import decode
 
@@ -62,11 +61,34 @@ class RegistrationStates(StatesGroup):
     waiting_for_phone = State()
 
 class AdminStates(StatesGroup):
-    waiting_for_scan = State()
-    waiting_for_user_id = State()
-    waiting_for_points = State()
+    waiting_for_scan_or_id = State()
+    waiting_for_points_action = State()
+    waiting_for_points_amount = State()
 
-# Команда старта
+# ========== КЛАВИАТУРЫ ==========
+
+def get_user_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="Мой QR-код")],
+            [types.KeyboardButton(text="Мои бонусы")],
+            [types.KeyboardButton(text="История операций")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_admin_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="Сканировать QR")],
+            [types.KeyboardButton(text="Ввести ID вручную")],
+            [types.KeyboardButton(text="Меню пользователя")]
+        ],
+        resize_keyboard=True
+    )
+
+# ========== ОСНОВНЫЕ КОМАНДЫ ==========
+
 @dp.message(Command('start'))
 async def start_command(message: types.Message):
     user_id = message.from_user.id
@@ -75,21 +97,36 @@ async def start_command(message: types.Message):
     user = cursor.fetchone()
     
     if user:
-        await message.answer("Добро пожаловать обратно! Используйте /menu для просмотра возможностей.")
+        await message.answer(
+            "Добро пожаловать обратно!",
+            reply_markup=get_user_keyboard()
+        )
     else:
-        await message.answer("Добро пожаловать в нашу кофейню! Для регистрации введите /register")
+        await message.answer(
+            "Добро пожаловать в нашу кофейню! Для регистрации введите /register",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
-# Регистрация пользователя
+@dp.message(Command('menu'))
+async def menu_command(message: types.Message):
+    user_id = message.from_user.id
+    if user_id in ADMIN_IDS:
+        await message.answer("Админ-меню:", reply_markup=get_admin_keyboard())
+    else:
+        await message.answer("Главное меню:", reply_markup=get_user_keyboard())
+
+# ========== КЛИЕНТСКИЕ ФУНКЦИИ ==========
+
 @dp.message(Command('register'))
 async def register_command(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
     cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
     if cursor.fetchone():
-        await message.answer("Вы уже зарегистрированы!")
+        await message.answer("Вы уже зарегистрированы!", reply_markup=get_user_keyboard())
         return
     
-    await message.answer("Пожалуйста, введите ваш номер телефона для регистрации:")
+    await message.answer("Пожалуйста, введите ваш номер телефона для регистрации:", reply_markup=ReplyKeyboardRemove())
     await state.set_state(RegistrationStates.waiting_for_phone)
 
 @dp.message(RegistrationStates.waiting_for_phone)
@@ -104,34 +141,18 @@ async def process_phone(message: types.Message, state: FSMContext):
     conn.commit()
     
     await state.clear()
-    await message.answer("Регистрация завершена! Теперь вы можете использовать /menu для просмотра возможностей.")
+    await message.answer(
+        "Регистрация завершена!",
+        reply_markup=get_user_keyboard()
+    )
 
-# Меню пользователя
-@dp.message(Command('menu'))
-async def user_menu(message: types.Message):
-    user_id = message.from_user.id
-    
-    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    user = cursor.fetchone()
-    
-    if not user:
-        await message.answer("Вы не зарегистрированы. Введите /register для регистрации.")
-        return
-    
-    builder = ReplyKeyboardBuilder()
-    builder.add(types.KeyboardButton(text="Мой QR-код"))
-    builder.add(types.KeyboardButton(text="Мои бонусы"))
-    builder.add(types.KeyboardButton(text="История операций"))
-    builder.adjust(2)
-    
-    await message.answer("Выберите действие:", reply_markup=builder.as_markup(resize_keyboard=True))
+@dp.message(F.text == "Мой QR-код")
+async def handle_qr_request(message: types.Message):
+    await show_qr_code(message)
 
-# Показать QR-код
-@dp.message(lambda message: message.text == "Мой QR-код")
 async def show_qr_code(message: types.Message):
     user_id = message.from_user.id
     
-    # Генерируем QR-код с ID пользователя
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -143,19 +164,14 @@ async def show_qr_code(message: types.Message):
     
     img = qr.make_image(fill_color="black", back_color="white")
     
-    # Сохраняем изображение в буфер
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     buf.seek(0)
     
-    # Создаем BufferedInputFile
     photo = BufferedInputFile(buf.getvalue(), filename="qrcode.png")
-    
-    # Отправляем изображение
-    await message.answer_photo(photo, caption="Ваш QR-код для бонусной программы")
+    await message.answer_photo(photo, caption="Ваш QR-код для бонусной программы", reply_markup=get_user_keyboard())
 
-# Показать бонусы
-@dp.message(lambda message: message.text == "Мои бонусы")
+@dp.message(F.text == "Мои бонусы")
 async def show_bonuses(message: types.Message):
     user_id = message.from_user.id
     
@@ -163,12 +179,17 @@ async def show_bonuses(message: types.Message):
     result = cursor.fetchone()
     
     if result:
-        await message.answer(f"Ваш текущий баланс бонусов: {result[0]}")
+        await message.answer(
+            f"Ваш текущий баланс бонусов: {result[0]}",
+            reply_markup=get_user_keyboard()
+        )
     else:
-        await message.answer("Вы не зарегистрированы в системе.")
+        await message.answer(
+            "Вы не зарегистрированы в системе.",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
-# Показать историю операций
-@dp.message(lambda message: message.text == "История операций")
+@dp.message(F.text == "История операций")
 async def show_history(message: types.Message):
     user_id = message.from_user.id
     
@@ -183,188 +204,176 @@ async def show_history(message: types.Message):
     transactions = cursor.fetchall()
     
     if not transactions:
-        await message.answer("У вас пока нет операций.")
+        await message.answer(
+            "У вас пока нет операций.",
+            reply_markup=get_user_keyboard()
+        )
         return
     
     response = "Последние 10 операций:\n\n"
     for amount, description, timestamp in transactions:
         response += f"{timestamp}: {description} - {amount} бонусов\n"
     
-    await message.answer(response)
+    await message.answer(response, reply_markup=get_user_keyboard())
 
-# Админ-панель
+# ========== АДМИН-ПАНЕЛЬ ==========
+
 @dp.message(Command('admin'))
 async def admin_panel(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Доступ запрещен")
+        await message.answer("Доступ запрещен", reply_markup=get_user_keyboard())
         return
     
-    builder = ReplyKeyboardBuilder()
-    builder.add(types.KeyboardButton(text="Начислить бонусы"))
-    builder.add(types.KeyboardButton(text="Списать бонусы"))
-    builder.add(types.KeyboardButton(text="Сканировать QR"))
-    builder.add(types.KeyboardButton(text="Отмена"))
-    builder.adjust(2)
-    
-    await message.answer("Админ-панель. Выберите действие:", reply_markup=builder.as_markup(resize_keyboard=True))
+    await message.answer(
+        "Админ-панель. Выберите действие:",
+        reply_markup=get_admin_keyboard()
+    )
 
-# Обработчик кнопки "Сканировать QR"
-@dp.message(lambda message: message.text == "Сканировать QR")
-async def scan_qr_command(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Доступ запрещен")
-        return
-    
-    await message.answer("Пожалуйста, отправьте фото QR-кода или введите ID пользователя вручную:", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(AdminStates.waiting_for_scan)
+@dp.message(F.text == "Меню пользователя")
+async def user_menu_button(message: types.Message):
+    await message.answer(
+        "Переключено в пользовательский режим",
+        reply_markup=get_user_keyboard()
+    )
 
+@dp.message(F.text == "Сканировать QR")
+async def request_qr_scan(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Пожалуйста, отправьте фото QR-кода:",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(AdminStates.waiting_for_scan_or_id)
 
-@dp.message(AdminStates.waiting_for_scan, F.content_type == 'photo')
-async def process_qr_scan(message: types.Message, state: FSMContext):
+@dp.message(F.text == "Ввести ID вручную")
+async def request_manual_id(message: types.Message, state: FSMContext):
+    await message.answer(
+        "Введите ID пользователя:",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(AdminStates.waiting_for_scan_or_id)
+
+@dp.message(AdminStates.waiting_for_scan_or_id, F.content_type == 'photo')
+async def process_qr_code(message: types.Message, state: FSMContext):
     try:
-        # Получаем файл изображения
-        file_id = message.photo[-1].file_id
-        file = await bot.get_file(file_id)
-        
-        # Создаем временный буфер для изображения
+        file = await bot.get_file(message.photo[-1].file_id)
         img_buffer = io.BytesIO()
-        await bot.download_file(file.file_path, destination=img_buffer)
+        await bot.download_file(file.file_path, img_buffer)
         img_buffer.seek(0)
         
-        # Декодируем QR-код
-        img = Image.open(img_buffer)
-        decoded = decode(img)
-        
+        decoded = decode(Image.open(img_buffer))
         if not decoded:
-            await message.answer("Не удалось распознать QR-код. Попробуйте еще раз или введите ID вручную.")
-            return
+            raise ValueError("QR не распознан")
             
         user_id = int(decoded[0].data.decode())
-        await state.update_data(user_id=user_id)
+        await process_user_id(user_id, message, state)
         
-        # Проверяем существование пользователя
-        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        if not cursor.fetchone():
-            await message.answer(f"Пользователь с ID {user_id} не найден.")
-            await state.clear()
-            return
-        
-        # Предлагаем выбрать действие
-        builder = ReplyKeyboardBuilder()
-        builder.add(types.KeyboardButton(text="Начислить бонусы"))
-        builder.add(types.KeyboardButton(text="Списать бонусы"))
-        builder.add(types.KeyboardButton(text="Отмена"))
-        builder.adjust(2)
-        
-        await message.answer(
-            f"Найден пользователь ID: {user_id}. Выберите действие:",
-            reply_markup=builder.as_markup(resize_keyboard=True)
-        )
-        await state.set_state(AdminStates.waiting_for_action)
-        
-    except ValueError:
-        await message.answer("Ошибка: QR-код содержит некорректный ID. Попробуйте еще раз.")
     except Exception as e:
-        await message.answer(f"Ошибка: {str(e)}. Попробуйте еще раз.")
+        await message.answer(
+            f"Ошибка: {str(e)}. Попробуйте еще раз.",
+            reply_markup=get_admin_keyboard()
+        )
     finally:
         if 'img_buffer' in locals():
             img_buffer.close()
 
-
-@dp.message(lambda message: message.text in ["Начислить бонусы", "Списать бонусы"])
-async def admin_action(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Доступ запрещен")
-        return
-    
-    action = "add" if message.text == "Начислить бонусы" else "subtract"
-    
-    await state.set_state(AdminStates.waiting_for_user_id)
-    await state.update_data(action=action)
-    await message.answer("Введите ID пользователя:", reply_markup=ReplyKeyboardRemove())
-
-# Модифицируем обработчик ручного ввода ID
-@dp.message(AdminStates.waiting_for_scan)
-async def process_manual_user_id(message: types.Message, state: FSMContext):
+@dp.message(AdminStates.waiting_for_scan_or_id)
+async def process_manual_input(message: types.Message, state: FSMContext):
     try:
         user_id = int(message.text)
-        await state.update_data(user_id=user_id)
-        
-        # Проверяем существование пользователя
-        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        if not cursor.fetchone():
-            await message.answer(f"Пользователь с ID {user_id} не найден.")
-            await state.clear()
-            return
-        
-        await message.answer(f"Найден пользователь ID: {user_id}. Выберите действие:", 
-                           reply_markup=types.ReplyKeyboardMarkup(
-                               keyboard=[
-                                   [types.KeyboardButton(text="Начислить бонусы")],
-                                   [types.KeyboardButton(text="Списать бонусы")],
-                                   [types.KeyboardButton(text="Отмена")]
-                               ],
-                               resize_keyboard=True
-                           ))
-        await state.set_state(AdminStates.waiting_for_action)
-        
+        await process_user_id(user_id, message, state)
     except ValueError:
-        await message.answer("Пожалуйста, введите корректный ID пользователя (число) или отправьте фото QR-кода.")
+        await message.answer(
+            "Некорректный ID. Введите число или отправьте QR-код.",
+            reply_markup=get_admin_keyboard()
+        )
 
-@dp.message(AdminStates.waiting_for_points)
-async def process_points(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Доступ запрещен")
+async def process_user_id(user_id: int, message: types.Message, state: FSMContext):
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    if not cursor.fetchone():
+        await message.answer(
+            f"Пользователь с ID {user_id} не найден.",
+            reply_markup=get_admin_keyboard()
+        )
         await state.clear()
         return
     
+    await state.update_data(user_id=user_id)
+    
+    builder = ReplyKeyboardBuilder()
+    builder.add(types.KeyboardButton(text="Начислить бонусы"))
+    builder.add(types.KeyboardButton(text="Списать бонусы"))
+    builder.add(types.KeyboardButton(text="Отмена"))
+    builder.adjust(2)
+    
+    await message.answer(
+        f"Пользователь ID: {user_id}. Выберите действие:",
+        reply_markup=builder.as_markup(resize_keyboard=True)
+    )
+    await state.set_state(AdminStates.waiting_for_points_action)
+
+@dp.message(AdminStates.waiting_for_points_action, F.text.in_(["Начислить бонусы", "Списать бонусы"]))
+async def process_points_action(message: types.Message, state: FSMContext):
+    await state.update_data(action=message.text)
+    await message.answer(
+        "Введите количество бонусов:",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(AdminStates.waiting_for_points_amount)
+
+@dp.message(AdminStates.waiting_for_points_amount)
+async def process_points_amount(message: types.Message, state: FSMContext):
     try:
         points = int(message.text)
+        if points <= 0:
+            raise ValueError("Число должно быть положительным")
+            
+        data = await state.get_data()
+        user_id = data['user_id']
+        action = data['action']
+        
+        cursor.execute('SELECT bonus_points FROM users WHERE user_id = ?', (user_id,))
+        current_points = cursor.fetchone()[0]
+        
+        if action == "Начислить бонусы":
+            new_points = current_points + points
+            description = "Начисление администратором"
+        else:
+            if current_points < points:
+                await message.answer(
+                    "Недостаточно бонусов для списания.",
+                    reply_markup=get_admin_keyboard()
+                )
+                return
+            new_points = current_points - points
+            description = "Списание администратором"
+        
+        cursor.execute('UPDATE users SET bonus_points = ? WHERE user_id = ?', (new_points, user_id))
+        cursor.execute(
+            'INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)',
+            (user_id, points if action == "Начислить бонусы" else -points, description)
+        )
+        conn.commit()
+        
+        await message.answer(
+            f"Успешно! Новый баланс: {new_points} бонусов\n"
+            f"Операция: {action} {points} бонусов",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.clear()
+        
     except ValueError:
-        await message.answer("Пожалуйста, введите корректное количество бонусов (число).")
-        return
-    
-    if points <= 0:
-        await message.answer("Количество бонусов должно быть положительным числом.")
-        return
-    
-    data = await state.get_data()
-    user_id = data['user_id']
-    action = data['action']
-    
-    cursor.execute('SELECT bonus_points FROM users WHERE user_id = ?', (user_id,))
-    current_points = cursor.fetchone()[0]
-    
-    if action == "add":
-        new_points = current_points + points
-        description = "Начисление администратором"
-    else:
-        if current_points < points:
-            await message.answer("У пользователя недостаточно бонусов.")
-            await state.clear()
-            return
-        new_points = current_points - points
-        description = "Списание администратором"
-    
-    cursor.execute('UPDATE users SET bonus_points = ? WHERE user_id = ?', (new_points, user_id))
-    cursor.execute(
-        'INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)',
-        (user_id, points if action == "add" else -points, description)
-    )
-    conn.commit()
-    
-    await message.answer(f"Операция успешно выполнена. Новый баланс пользователя: {new_points}")
-    await state.clear()
+        await message.answer(
+            "Введите корректное число бонусов (целое положительное число).",
+            reply_markup=get_admin_keyboard()
+        )
 
-# Отмена действий
-@dp.message(lambda message: message.text == "Отмена")
+@dp.message(F.text == "Отмена")
 async def cancel_action(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Доступ запрещен")
-        return
-    
     await state.clear()
-    await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
+    await message.answer(
+        "Действие отменено.",
+        reply_markup=get_admin_keyboard() if message.from_user.id in ADMIN_IDS else get_user_keyboard()
+    )
 
 async def main():
     await dp.start_polling(bot)
