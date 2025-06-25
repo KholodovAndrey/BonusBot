@@ -38,8 +38,8 @@ load_dotenv()
 
 # Конфигурация
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_IDS = [123456]  # Замените на ID администраторов
-SMM_IDS = [336076029]    # Замените на ID SMM-менеджеров
+ADMIN_IDS = [int(id_str) for id_str in os.getenv('ADMIN_IDS', '').split(',') if id_str]
+SMM_IDS = [int(id_str) for id_str in os.getenv('SMM_IDS', '').split(',') if id_str]
 
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
