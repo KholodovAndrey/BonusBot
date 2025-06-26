@@ -13,7 +13,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, ReplyKeyboardMarkup
-from aiogram.types import ReplyKeyboardRemove, BufferedInputFile
+from aiogram.types import (
+    ReplyKeyboardRemove,
+    BufferedInputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
 from aiogram.filters import Command
 from dotenv import load_dotenv
 from PIL import Image
@@ -100,6 +105,9 @@ class SMMStates(StatesGroup):
     waiting_for_news_title = State()
     waiting_for_news_content = State()
     waiting_for_news_image = State()
+    waiting_post_action = State()
+    waiting_edit_field = State()
+    waiting_new_value = State()
 
 # ========== КЛАВИАТУРЫ ==========
 def get_user_keyboard():
@@ -116,8 +124,8 @@ def get_user_keyboard():
 def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text="Сканировать QR")],
-            [types.KeyboardButton(text="Ввести ID вручную")]
+            [types.KeyboardButton(text="Сканировать QR"), types.KeyboardButton(text="Ввести ID вручную")],
+            [types.KeyboardButton(text="Назад")]
         ],
         resize_keyboard=True
     )
@@ -126,11 +134,20 @@ def get_smm_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="Создать пост")],
-            [types.KeyboardButton(text="Мои посты")],
-            [types.KeyboardButton(text="Назад")]
+            [types.KeyboardButton(text="Мои посты")]
         ],
         resize_keyboard=True
     )
+
+def get_post_management_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.add(types.KeyboardButton(text="Редактировать заголовок"))
+    builder.add(types.KeyboardButton(text="Редактировать текст"))
+    builder.add(types.KeyboardButton(text="Заменить изображение"))
+    builder.add(types.KeyboardButton(text="Удалить пост"))
+    builder.add(types.KeyboardButton(text="Отмена"))
+    builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True)
 
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 @dp.message(Command('start'))
@@ -241,21 +258,30 @@ async def show_history(message: types.Message):
     await message.answer(response, reply_markup=get_user_keyboard())
 
 # ========== АДМИН-ФУНКЦИИ ==========
-@dp.message(F.text == "Сканировать QR")
-async def request_qr_scan(message: types.Message, state: FSMContext):
+@dp.message(F.text.in_(["Сканировать QR", "Ввести ID вручную"]))
+async def handle_admin_commands(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
     
-    await message.answer("Отправьте фото QR-кода:", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(AdminStates.waiting_for_scan_or_id)
+    if message.text == "Сканировать QR":
+        await message.answer("Отправьте фото QR-кода:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(AdminStates.waiting_for_scan_or_id)
+    else:
+        await message.answer("Введите ID пользователя:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(AdminStates.waiting_for_scan_or_id)
 
-@dp.message(F.text == "Ввести ID вручную")
-async def request_manual_id(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
+@dp.message(F.text == "Назад")
+async def back_to_menu(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
     
-    await message.answer("Введите ID пользователя:", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(AdminStates.waiting_for_scan_or_id)
+    await state.clear()
+    
+    if user_id in ADMIN_IDS:
+        await message.answer("Главное меню администратора", reply_markup=get_admin_keyboard())
+    elif user_id in SMM_IDS:
+        await message.answer("Главное меню SMM", reply_markup=get_smm_keyboard())
+    else:
+        await message.answer("Главное меню", reply_markup=get_user_keyboard())
 
 @dp.message(AdminStates.waiting_for_scan_or_id, F.content_type == 'photo')
 async def process_qr_code(message: types.Message, state: FSMContext):
@@ -304,8 +330,15 @@ async def process_user_id(user_id: int, message: types.Message, state: FSMContex
     )
     await state.set_state(AdminStates.waiting_for_points_action)
 
-@dp.message(AdminStates.waiting_for_points_action, F.text.in_(["Начислить бонусы", "Списать бонусы"]))
+@dp.message(AdminStates.waiting_for_points_action)
 async def process_points_action(message: types.Message, state: FSMContext):
+    if message.text == "Назад":
+        await back_to_menu(message, state)
+        return
+    
+    if message.text not in ["Начислить бонусы", "Списать бонусы"]:
+        return
+    
     await state.update_data(action=message.text)
     
     if message.text == "Начислить бонусы":
@@ -442,9 +475,13 @@ async def skip_news_image(message: types.Message, state: FSMContext):
     await state.clear()
 
 async def save_and_publish_news(message: types.Message, data: dict, image_path: str):
+    relative_path = None
+    if image_path:
+        relative_path = str(Path(image_path).relative_to(SCRIPT_DIR))
+    
     cursor.execute(
         'INSERT INTO news (author_id, title, content, image_path) VALUES (?, ?, ?, ?)',
-        (message.from_user.id, data['title'], data['content'], image_path)
+        (message.from_user.id, data['title'], data['content'], relative_path)
     )
     conn.commit()
     
@@ -471,13 +508,17 @@ async def save_and_publish_news(message: types.Message, data: dict, image_path: 
     await message.answer("Пост опубликован!", reply_markup=get_smm_keyboard())
 
 @dp.message(F.text == "Мои посты")
-async def show_smm_posts(message: types.Message):
+async def show_smm_posts(message: types.Message, state: FSMContext):
     if message.from_user.id not in SMM_IDS:
         return
     
+    # Запрос с сортировкой от старых к новым
     cursor.execute('''
-    SELECT title, content, image_path, timestamp FROM news 
-    WHERE author_id = ? ORDER BY timestamp DESC LIMIT 10
+    SELECT id, title, content, image_path 
+    FROM news 
+    WHERE author_id = ? 
+    ORDER BY timestamp ASC  -- Сортировка по возрастанию (старые сначала)
+    LIMIT 10
     ''', (message.from_user.id,))
     
     posts = cursor.fetchall()
@@ -485,31 +526,153 @@ async def show_smm_posts(message: types.Message):
         await message.answer("У вас нет постов", reply_markup=get_smm_keyboard())
         return
     
-    for title, content, image_path, timestamp in posts:
+    # Сохраняем посты в FSM для управления
+    await state.update_data(posts={post[0]: post[1:] for post in posts})
+    
+    # Вывод постов без дат и нумерации
+    for post_id, title, content, image_path in posts:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Управление постом", callback_data=f"manage_post_{post_id}")]
+        ])
+        
         try:
             if image_path:
                 with open(image_path, 'rb') as photo:
                     await message.answer_photo(
                         photo=BufferedInputFile(photo.read(), filename="post.jpg"),
-                        caption=f"<b>{title}</b>\n\n{content}\n\n{timestamp}",
-                        reply_markup=get_smm_keyboard()
+                        caption=f"<b>{title}</b>\n\n{content}",
+                        reply_markup=kb
                     )
             else:
                 await message.answer(
-                    f"<b>{title}</b>\n\n{content}\n\n{timestamp}",
-                    reply_markup=get_smm_keyboard()
+                    f"<b>{title}</b>\n\n{content}",
+                    reply_markup=kb
                 )
         except Exception as e:
             await message.answer(
-                f"<b>{title}</b>\n\n{content}\n\n{timestamp}\n\n[Изображение недоступно]",
+                f"<b>{title}</b>\n\n{content}\n\n[Изображение недоступно]",
+                reply_markup=kb
+            )
+# Обработчик выбора поста для управления
+@dp.callback_query(F.data.startswith("manage_post_"))
+async def manage_post(callback: types.CallbackQuery, state: FSMContext):
+    post_id = int(callback.data.split("_")[-1])
+    await state.update_data(current_post_id=post_id)
+    await callback.message.answer(
+        "Выберите действие с постом:",
+        reply_markup=get_post_management_keyboard()
+    )
+    await state.set_state(SMMStates.waiting_post_action)
+    await callback.answer()
+
+# Обработчик выбора действия
+@dp.message(SMMStates.waiting_post_action)
+async def process_post_action(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    post_id = data['current_post_id']
+    
+    if message.text == "Удалить пост":
+        cursor.execute('DELETE FROM news WHERE id = ?', (post_id,))
+        conn.commit()
+        await message.answer("Пост успешно удалён", reply_markup=get_smm_keyboard())
+        await state.clear()
+    
+    elif message.text.startswith("Редактировать"):
+        field = message.text.split()[-1]
+        await state.update_data(edit_field=field.lower())
+        await message.answer(f"Введите новый {field}:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(SMMStates.waiting_new_value)
+    
+    elif message.text == "Заменить изображение":
+        await message.answer("Отправьте новое изображение:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(SMMStates.waiting_for_news_image)
+    
+    elif message.text == "Отмена":
+        await message.answer("Действие отменено", reply_markup=get_smm_keyboard())
+        await state.clear()
+
+# Обработчик нового значения для редактирования
+@dp.message(SMMStates.waiting_new_value)
+async def process_new_value(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    post_id = data['current_post_id']
+    field = data['edit_field']
+    
+    if field in ['заголовок', 'текст']:
+        db_field = 'title' if field == 'заголовок' else 'content'
+        cursor.execute(f'UPDATE news SET {db_field} = ? WHERE id = ?', 
+                      (message.text, post_id))
+        conn.commit()
+        await message.answer(f"{field.capitalize()} успешно обновлён", reply_markup=get_smm_keyboard())
+    await state.clear()
+
+@dp.message(SMMStates.waiting_for_news_image, F.content_type == 'photo')
+async def process_new_image(message: types.Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        post_id = data.get('current_post_id')
+        
+        if not post_id:
+            await message.answer("Ошибка: не найден ID поста", reply_markup=get_smm_keyboard())
+            await state.clear()
+            return
+
+        # Получаем текущий пост из базы данных
+        cursor.execute('SELECT title, content, image_path FROM news WHERE id = ?', (post_id,))
+        post = cursor.fetchone()
+        
+        if not post:
+            await message.answer("Ошибка: пост не найден", reply_markup=get_smm_keyboard())
+            await state.clear()
+            return
+            
+        title, content, old_image_path = post
+        
+        # Сохраняем новое изображение
+        file = await bot.get_file(message.photo[-1].file_id)
+        img_filename = f"{message.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+        img_path = str(SCRIPT_DIR / "news_images" / img_filename)
+        
+        # Создаем папку если ее нет
+        os.makedirs(SCRIPT_DIR / "news_images", exist_ok=True)
+        await bot.download_file(file.file_path, img_path)
+        
+        # Удаляем старое изображение, если оно существует
+        if old_image_path and os.path.exists(old_image_path):
+            try:
+                os.remove(old_image_path)
+            except Exception as e:
+                logger.error(f"Ошибка при удалении старого изображения: {e}")
+        
+        # Обновляем только изображение в базе данных
+        relative_img_path = str(Path("news_images") / img_filename)
+        cursor.execute('UPDATE news SET image_path = ? WHERE id = ?', (relative_img_path, post_id))
+        conn.commit()
+        
+        # Показываем обновленный пост
+        with open(img_path, 'rb') as photo:
+            await message.answer_photo(
+                photo=BufferedInputFile(photo.read(), filename="updated_post.jpg"),
+                caption=f"<b>{title}</b>\n\n{content}",
                 reply_markup=get_smm_keyboard()
             )
+            
+        await message.answer("Изображение в посте успешно обновлено!", reply_markup=get_smm_keyboard())
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении изображения: {e}")
+        await message.answer(
+            "Произошла ошибка при обновлении изображения",
+            reply_markup=get_smm_keyboard()
+        )
+    finally:
+        await state.clear()
 
 @dp.message(F.text == "Новости и акции")
 async def show_news(message: types.Message):
     cursor.execute('''
     SELECT title, content, image_path, timestamp FROM news 
-    ORDER BY timestamp DESC LIMIT 10
+    ORDER BY timestamp LIMIT 10
     ''')
     
     news_items = cursor.fetchall()
@@ -523,29 +686,19 @@ async def show_news(message: types.Message):
                 with open(image_path, 'rb') as photo:
                     await message.answer_photo(
                         photo=BufferedInputFile(photo.read(), filename="news.jpg"),
-                        caption=f"<b>{title}</b>\n\n{content}\n\n{timestamp}",
+                        caption=f"<b>{title}</b>\n\n{content}",
                         reply_markup=get_user_keyboard()
                     )
             else:
                 await message.answer(
-                    f"<b>{title}</b>\n\n{content}\n\n{timestamp}",
+                    f"<b>{title}</b>\n\n{content}",
                     reply_markup=get_user_keyboard()
                 )
         except Exception as e:
             await message.answer(
-                f"<b>{title}</b>\n\n{content}\n\n{timestamp}\n\n[Изображение недоступно]",
+                f"<b>{title}</b>\n\n{content}\n\n[Изображение недоступно]",
                 reply_markup=get_user_keyboard()
             )
-
-@dp.message(F.text == "Назад")
-async def back_to_menu(message: types.Message):
-    user_id = message.from_user.id
-    if user_id in ADMIN_IDS:
-        await message.answer("Главное меню", reply_markup=get_admin_keyboard())
-    elif user_id in SMM_IDS:
-        await message.answer("Главное меню", reply_markup=get_smm_keyboard())
-    else:
-        await message.answer("Главное меню", reply_markup=get_user_keyboard())
 
 @dp.message(F.text == "Отмена")
 async def cancel_action(message: types.Message, state: FSMContext):
