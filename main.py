@@ -26,7 +26,8 @@ from pyzbar.pyzbar import decode
 
 # Настройка путей
 SCRIPT_DIR = Path(__file__).parent.absolute()
-os.makedirs(SCRIPT_DIR / "news_images", exist_ok=True)
+NEWS_IMAGES_DIR = SCRIPT_DIR / "news_images"
+os.makedirs(NEWS_IMAGES_DIR, exist_ok=True)
 
 # Настройка логгирования
 logging.basicConfig(
@@ -459,65 +460,79 @@ async def process_news_content(message: types.Message, state: FSMContext):
 
 @dp.message(SMMStates.waiting_for_news_image, F.content_type == 'photo')
 async def process_news_image(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    
+    if 'title' not in data or 'content' not in data:
+        await message.answer("Ошибка: данные поста потеряны. Начните заново.", reply_markup=get_smm_keyboard())
+        await state.clear()
+        return
+    
+    # Сохраняем изображение
     file = await bot.get_file(message.photo[-1].file_id)
-    img_path = str(SCRIPT_DIR / f"news_images/{message.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg")
+    img_filename = f"{message.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+    img_path = NEWS_IMAGES_DIR / img_filename
     
     await bot.download_file(file.file_path, img_path)
     
-    data = await state.get_data()
-    await save_and_publish_news(message, data, img_path)
+    await save_and_publish_news(message, data, str(img_path.relative_to(SCRIPT_DIR)))
     await state.clear()
 
 @dp.message(SMMStates.waiting_for_news_image, Command('skip'))
 async def skip_news_image(message: types.Message, state: FSMContext):
     data = await state.get_data()
+    
+    if 'title' not in data or 'content' not in data:
+        await message.answer("Ошибка: данные поста потеряны. Начните заново.", reply_markup=get_smm_keyboard())
+        await state.clear()
+        return
+    
     await save_and_publish_news(message, data, None)
     await state.clear()
 
 async def save_and_publish_news(message: types.Message, data: dict, image_path: str):
-    relative_path = None
-    if image_path:
-        relative_path = str(Path(image_path).relative_to(SCRIPT_DIR))
-    
-    cursor.execute(
-        'INSERT INTO news (author_id, title, content, image_path) VALUES (?, ?, ?, ?)',
-        (message.from_user.id, data['title'], data['content'], relative_path)
-    )
-    conn.commit()
-    
-    cursor.execute('SELECT user_id FROM users')
-    users = [row[0] for row in cursor.fetchall()]
-    
-    for user_id in users:
-        try:
-            if image_path:
-                with open(image_path, 'rb') as photo:
-                    await bot.send_photo(
+    try:
+        cursor.execute(
+            'INSERT INTO news (author_id, title, content, image_path) VALUES (?, ?, ?, ?)',
+            (message.from_user.id, data['title'], data['content'], image_path)
+        )
+        conn.commit()
+        
+        cursor.execute('SELECT user_id FROM users')
+        users = [row[0] for row in cursor.fetchall()]
+        
+        for user_id in users:
+            try:
+                if image_path:
+                    full_image_path = SCRIPT_DIR / image_path
+                    with open(full_image_path, 'rb') as photo:
+                        await bot.send_photo(
+                            user_id,
+                            photo=BufferedInputFile(photo.read(), filename="news.jpg"),
+                            caption=f"<b>{data['title']}</b>\n\n{data['content']}"
+                        )
+                else:
+                    await bot.send_message(
                         user_id,
-                        photo=BufferedInputFile(photo.read(), filename="news.jpg"),
-                        caption=f"<b>{data['title']}</b>\n\n{data['content']}"
+                        f"<b>{data['title']}</b>\n\n{data['content']}"
                     )
-            else:
-                await bot.send_message(
-                    user_id,
-                    f"<b>{data['title']}</b>\n\n{data['content']}"
-                )
-        except Exception as e:
-            logger.error(f"Failed to send news to {user_id}: {e}")
-    
-    await message.answer("Пост опубликован!", reply_markup=get_smm_keyboard())
+            except Exception as e:
+                logger.error(f"Failed to send news to {user_id}: {e}")
+        
+        await message.answer("Пост опубликован!", reply_markup=get_smm_keyboard())
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении поста: {e}")
+        await message.answer("Произошла ошибка при сохранении поста", reply_markup=get_smm_keyboard())
 
 @dp.message(F.text == "Мои посты")
 async def show_smm_posts(message: types.Message, state: FSMContext):
     if message.from_user.id not in SMM_IDS:
         return
     
-    # Запрос с сортировкой от старых к новым
     cursor.execute('''
     SELECT id, title, content, image_path 
     FROM news 
     WHERE author_id = ? 
-    ORDER BY timestamp ASC  -- Сортировка по возрастанию (старые сначала)
+    ORDER BY timestamp DESC
     LIMIT 10
     ''', (message.from_user.id,))
     
@@ -526,10 +541,8 @@ async def show_smm_posts(message: types.Message, state: FSMContext):
         await message.answer("У вас нет постов", reply_markup=get_smm_keyboard())
         return
     
-    # Сохраняем посты в FSM для управления
     await state.update_data(posts={post[0]: post[1:] for post in posts})
     
-    # Вывод постов без дат и нумерации
     for post_id, title, content, image_path in posts:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Управление постом", callback_data=f"manage_post_{post_id}")]
@@ -537,10 +550,17 @@ async def show_smm_posts(message: types.Message, state: FSMContext):
         
         try:
             if image_path:
-                with open(image_path, 'rb') as photo:
-                    await message.answer_photo(
-                        photo=BufferedInputFile(photo.read(), filename="post.jpg"),
-                        caption=f"<b>{title}</b>\n\n{content}",
+                full_image_path = SCRIPT_DIR / image_path
+                if full_image_path.exists():
+                    with open(full_image_path, 'rb') as photo:
+                        await message.answer_photo(
+                            photo=BufferedInputFile(photo.read(), filename="post.jpg"),
+                            caption=f"<b>{title}</b>\n\n{content}",
+                            reply_markup=kb
+                        )
+                else:
+                    await message.answer(
+                        f"<b>{title}</b>\n\n{content}\n\n[Изображение недоступно]",
                         reply_markup=kb
                     )
             else:
@@ -549,11 +569,12 @@ async def show_smm_posts(message: types.Message, state: FSMContext):
                     reply_markup=kb
                 )
         except Exception as e:
+            logger.error(f"Ошибка при показе поста {post_id}: {e}")
             await message.answer(
-                f"<b>{title}</b>\n\n{content}\n\n[Изображение недоступно]",
+                f"<b>{title}</b>\n\n{content}\n\n[Ошибка при загрузке изображения]",
                 reply_markup=kb
             )
-# Обработчик выбора поста для управления
+
 @dp.callback_query(F.data.startswith("manage_post_"))
 async def manage_post(callback: types.CallbackQuery, state: FSMContext):
     post_id = int(callback.data.split("_")[-1])
@@ -565,13 +586,22 @@ async def manage_post(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(SMMStates.waiting_post_action)
     await callback.answer()
 
-# Обработчик выбора действия
 @dp.message(SMMStates.waiting_post_action)
 async def process_post_action(message: types.Message, state: FSMContext):
     data = await state.get_data()
     post_id = data['current_post_id']
     
     if message.text == "Удалить пост":
+        cursor.execute('SELECT image_path FROM news WHERE id = ?', (post_id,))
+        result = cursor.fetchone()
+        if result and result[0]:
+            try:
+                image_path = SCRIPT_DIR / result[0]
+                if image_path.exists():
+                    os.remove(image_path)
+            except Exception as e:
+                logger.error(f"Ошибка при удалении изображения: {e}")
+        
         cursor.execute('DELETE FROM news WHERE id = ?', (post_id,))
         conn.commit()
         await message.answer("Пост успешно удалён", reply_markup=get_smm_keyboard())
@@ -584,6 +614,25 @@ async def process_post_action(message: types.Message, state: FSMContext):
         await state.set_state(SMMStates.waiting_new_value)
     
     elif message.text == "Заменить изображение":
+        # Получаем текущий пост из базы данных
+        cursor.execute('SELECT title, content FROM news WHERE id = ?', (post_id,))
+        post = cursor.fetchone()
+        
+        if not post:
+            await message.answer("Ошибка: пост не найден", reply_markup=get_smm_keyboard())
+            await state.clear()
+            return
+            
+        title, content = post
+        
+        # Сохраняем данные поста в состоянии
+        await state.update_data(
+            current_post_id=post_id,
+            title=title,
+            content=content,
+            is_image_replacement=True  # Флаг, что это замена изображения
+        )
+        
         await message.answer("Отправьте новое изображение:", reply_markup=ReplyKeyboardRemove())
         await state.set_state(SMMStates.waiting_for_news_image)
     
@@ -591,7 +640,6 @@ async def process_post_action(message: types.Message, state: FSMContext):
         await message.answer("Действие отменено", reply_markup=get_smm_keyboard())
         await state.clear()
 
-# Обработчик нового значения для редактирования
 @dp.message(SMMStates.waiting_new_value)
 async def process_new_value(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -607,45 +655,40 @@ async def process_new_value(message: types.Message, state: FSMContext):
     await state.clear()
 
 @dp.message(SMMStates.waiting_for_news_image, F.content_type == 'photo')
-async def process_new_image(message: types.Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        post_id = data.get('current_post_id')
+async def process_news_image(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    
+    # Проверяем, это создание нового поста или замена изображения
+    is_replacement = data.get('is_image_replacement', False)
+    
+    if is_replacement:
+        # Это замена изображения в существующем посте
+        post_id = data['current_post_id']
+        title = data['title']
+        content = data['content']
         
-        if not post_id:
-            await message.answer("Ошибка: не найден ID поста", reply_markup=get_smm_keyboard())
-            await state.clear()
-            return
-
-        # Получаем текущий пост из базы данных
-        cursor.execute('SELECT title, content, image_path FROM news WHERE id = ?', (post_id,))
-        post = cursor.fetchone()
-        
-        if not post:
-            await message.answer("Ошибка: пост не найден", reply_markup=get_smm_keyboard())
-            await state.clear()
-            return
-            
-        title, content, old_image_path = post
+        # Получаем старое изображение
+        cursor.execute('SELECT image_path FROM news WHERE id = ?', (post_id,))
+        old_image_path = cursor.fetchone()[0]
         
         # Сохраняем новое изображение
         file = await bot.get_file(message.photo[-1].file_id)
         img_filename = f"{message.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
-        img_path = str(SCRIPT_DIR / "news_images" / img_filename)
+        img_path = NEWS_IMAGES_DIR / img_filename
         
-        # Создаем папку если ее нет
-        os.makedirs(SCRIPT_DIR / "news_images", exist_ok=True)
         await bot.download_file(file.file_path, img_path)
         
         # Удаляем старое изображение, если оно существует
-        if old_image_path and os.path.exists(old_image_path):
-            try:
-                os.remove(old_image_path)
-            except Exception as e:
-                logger.error(f"Ошибка при удалении старого изображения: {e}")
+        if old_image_path:
+            old_full_path = SCRIPT_DIR / old_image_path
+            if old_full_path.exists():
+                try:
+                    os.remove(old_full_path)
+                except Exception as e:
+                    logger.error(f"Ошибка при удалении старого изображения: {e}")
         
-        # Обновляем только изображение в базе данных
-        relative_img_path = str(Path("news_images") / img_filename)
+        # Обновляем изображение в базе данных
+        relative_img_path = str(img_path.relative_to(SCRIPT_DIR))
         cursor.execute('UPDATE news SET image_path = ? WHERE id = ?', (relative_img_path, post_id))
         conn.commit()
         
@@ -658,21 +701,31 @@ async def process_new_image(message: types.Message, state: FSMContext):
             )
             
         await message.answer("Изображение в посте успешно обновлено!", reply_markup=get_smm_keyboard())
+        await state.clear()
         
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении изображения: {e}")
-        await message.answer(
-            "Произошла ошибка при обновлении изображения",
-            reply_markup=get_smm_keyboard()
-        )
-    finally:
+    else:
+        # Это создание нового поста (существующий код)
+        if 'title' not in data or 'content' not in data:
+            await message.answer("Ошибка: данные поста потеряны. Начните заново.", reply_markup=get_smm_keyboard())
+            await state.clear()
+            return
+        
+        # Сохраняем изображение
+        file = await bot.get_file(message.photo[-1].file_id)
+        img_filename = f"{message.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+        img_path = NEWS_IMAGES_DIR / img_filename
+        
+        await bot.download_file(file.file_path, img_path)
+        
+        await save_and_publish_news(message, data, str(img_path.relative_to(SCRIPT_DIR)))
         await state.clear()
 
 @dp.message(F.text == "Новости и акции")
 async def show_news(message: types.Message):
     cursor.execute('''
-    SELECT title, content, image_path, timestamp FROM news 
-    ORDER BY timestamp LIMIT 10
+    SELECT title, content, image_path FROM news 
+    ORDER BY timestamp DESC 
+    LIMIT 10
     ''')
     
     news_items = cursor.fetchall()
@@ -680,13 +733,20 @@ async def show_news(message: types.Message):
         await message.answer("Новостей пока нет", reply_markup=get_user_keyboard())
         return
     
-    for title, content, image_path, timestamp in news_items:
+    for title, content, image_path in news_items:
         try:
             if image_path:
-                with open(image_path, 'rb') as photo:
-                    await message.answer_photo(
-                        photo=BufferedInputFile(photo.read(), filename="news.jpg"),
-                        caption=f"<b>{title}</b>\n\n{content}",
+                full_image_path = SCRIPT_DIR / image_path
+                if full_image_path.exists():
+                    with open(full_image_path, 'rb') as photo:
+                        await message.answer_photo(
+                            photo=BufferedInputFile(photo.read(), filename="news.jpg"),
+                            caption=f"<b>{title}</b>\n\n{content}",
+                            reply_markup=get_user_keyboard()
+                        )
+                else:
+                    await message.answer(
+                        f"<b>{title}</b>\n\n{content}\n\n[Изображение недоступно]",
                         reply_markup=get_user_keyboard()
                     )
             else:
@@ -696,7 +756,7 @@ async def show_news(message: types.Message):
                 )
         except Exception as e:
             await message.answer(
-                f"<b>{title}</b>\n\n{content}\n\n[Изображение недоступно]",
+                f"<b>{title}</b>\n\n{content}\n\n[Ошибка при загрузке изображения]",
                 reply_markup=get_user_keyboard()
             )
 
