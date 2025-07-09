@@ -355,15 +355,19 @@ async def process_receipt_amount(message: types.Message, state: FSMContext):
         receipt_amount = float(message.text.replace(',', '.'))
         if receipt_amount <= 0:
             raise ValueError("Сумма должна быть положительной")
+        if receipt_amount >= 2000:
+            sum_points = 7
+        else:
+            sum_points = 5
             
-        points = int(round(receipt_amount * 0.15))
+        points = int(round(receipt_amount * sum_points/100))
         data = await state.get_data()
         user_id = data['user_id']
         
         cursor.execute('UPDATE users SET bonus_points = bonus_points + ? WHERE user_id = ?', (points, user_id))
         cursor.execute(
             'INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)',
-            (user_id, points, f"Начисление 10% от чека {receipt_amount} руб.")
+            (user_id, points, f"Начисление {sum_points} % от чека {receipt_amount} руб.")
         )
         conn.commit()
         
